@@ -1,6 +1,7 @@
 package apiserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,13 +14,16 @@ import (
 )
 
 const (
-	sessionName = "session_name"
+	sessionName        = "session_name"
+	ctxKeyUser  ctxKey = iota
 )
 
 var (
 	errIncorrectEmailOrPassword = errors.New("Incorrect email or password")
+	errUserNotAuthenticated     = errors.New("User not authenticated")
 )
 
+type ctxKey int8
 type server struct {
 	router       *mux.Router
 	logger       *logrus.Logger
@@ -49,6 +53,40 @@ func (s *server) configureRouter() {
 	s.router.HandleFunc("/users", s.handleUsersCreate()).Methods("POST")
 	s.router.HandleFunc("/users", s.handleUsersGET()).Methods("GET")
 	s.router.HandleFunc("/sessions", s.handleSessionCreate()).Methods("POST")
+
+	private := s.router.PathPrefix("/private").Subrouter()
+	private.Use(s.authenticateUser)
+	private.HandleFunc("/whoami", s.handleWhoAmI()).Methods("GET")
+}
+
+func (s *server) authenticateUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session, err := s.sessionStore.Get(r, sessionName)
+		if err != nil {
+			s.error(w, r, http.StatusInternalServerError, err)
+			return
+		}
+
+		id, ok := session.Values["user_id"]
+		if !ok {
+			s.error(w, r, http.StatusUnauthorized, errUserNotAuthenticated)
+			return
+		}
+
+		u, err := s.store.User().Find(id.(int))
+		if err != nil {
+			s.error(w, r, http.StatusUnauthorized, errUserNotAuthenticated)
+			return
+		}
+
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyUser, u)))
+	})
+}
+
+func (s *server) handleWhoAmI() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.respond(w, r, http.StatusOK, r.Context().Value(ctxKeyUser).(*model.User))
+	}
 }
 
 func (s *server) handleUsersCreate() http.HandlerFunc {
@@ -83,8 +121,6 @@ func (s *server) handleUsersGET() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		rows, err := s.store.User().FindAll(0, 10)
-
-		s.logger.Info(rows)
 
 		if err != nil {
 			s.error(w, r, http.StatusInternalServerError, err)
